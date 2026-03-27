@@ -1,196 +1,302 @@
 """
-Dataset Streaming for RLM
-Stream datasets to REPL variables without downloading
+Dataset Loading for RLM
+Load HF datasets directly to RLM context
 """
 
-from datatrove.pipeline.readers import ParquetReader
 from datasets import load_dataset
-from typing import Generator, Union, Dict, List
+from typing import Dict, List, Any, Generator
 
 
 class DatasetStreamer:
-    """Stream datasets to RLM REPL as context variables"""
-    
-    def __init__(self, dataset_name: str, split: str = None, limit: int = None):
+    """Load HF datasets directly to RLM REPL as context variables"""
+
+    def __init__(self, dataset_name: str = "fineweb", rlm_instance=None, limit: int = None):
         """
         Args:
-            dataset_name: HuggingFace dataset name or path
-            split: Dataset split (train, test, etc.)
-            limit: Limit number of documents (None for all)
+            dataset_name: Name of dataset ("fineweb", "finewiki", "the-stack")
+            rlm_instance: RLM instance to load context into
+            limit: Maximum number of documents to stream
         """
         self.dataset_name = dataset_name
-        self.split = split
+        self.rlm = rlm_instance
         self.limit = limit
-        self.count = 0
-    
+        self.loaded_datasets = {}
+
     def stream_fineweb(self) -> Generator[Dict, None, None]:
-        """Stream FineWeb dataset (parquet format)"""
-        # Stream from HF without downloading
-        reader = ParquetReader("hf://datasets/HuggingFaceFW/fineweb/data")
-        
-        for document in reader():
-            if self.limit and self.count >= self.limit:
-                break
-            self.count += 1
-            yield {
-                "text": document.get("text", ""),
-                "id": document.get("id", ""),
-                "source": "fineweb"
-            }
-    
-    def stream_finewiki(self) -> Generator[Dict, None, None]:
-        """Stream FineWiki dataset"""
-        ds = load_dataset("HuggingFaceFW/finewiki", split=self.split)
-        
+        """
+        Stream FineWeb dataset without downloading entire thing.
+
+        Yields:
+            Document dicts with 'text' and 'source' keys
+        """
+        print("Streaming FineWeb dataset...")
+        ds = load_dataset(
+            "HuggingFaceFW/fineweb",
+            split="train",
+            streaming=True,
+        )
+        count = 0
         for item in ds:
-            if self.limit and self.count >= self.limit:
+            if self.limit and count >= self.limit:
                 break
-            self.count += 1
+            yield {
+                "text": item.get("text", ""),
+                "source": "fineweb",
+            }
+            count += 1
+        print(f"✅ Streamed {count} FineWeb documents")
+
+    def stream_finewiki(self) -> Generator[Dict, None, None]:
+        """
+        Stream FineWiki dataset.
+
+        Yields:
+            Document dicts with 'text', 'title', and 'source' keys
+        """
+        print("Streaming FineWiki dataset...")
+        ds = load_dataset(
+            "HuggingFaceFW/finewiki",
+            split="train",
+            streaming=True,
+        )
+        count = 0
+        for item in ds:
+            if self.limit and count >= self.limit:
+                break
             yield {
                 "text": item.get("text", ""),
                 "title": item.get("title", ""),
-                "source": "finewiki"
+                "source": "finewiki",
             }
-    
-    def stream_the_stack(self) -> Generator[Dict, None, None]:
-        """Stream The-Stack v2 code dataset"""
-        ds = load_dataset("bigcode/the-stack-v2")
-        
-        for file in ds:
-            if self.limit and self.count >= self.limit:
-                break
-            self.count += 1
-            yield {
-                "code": file.get("content", ""),
-                "path": file.get("path", ""),
-                "language": file.get("language", ""),
-                "source": "the-stack"
-            }
-    
-    def stream_to_repl(self, var_name: str = "context") -> Generator[str, None, None]:
+            count += 1
+        print(f"✅ Streamed {count} FineWiki documents")
+
+    def stream_the_stack(self, language: str = "python") -> Generator[Dict, None, None]:
         """
-        Stream dataset to RLM REPL as context variable
-        
+        Stream The-Stack v2 code dataset.
+
         Args:
-            var_name: Variable name in REPL (context_0, context_1, etc.)
-            
+            language: Programming language filter
+
         Yields:
-            Python code to add context to REPL
+            Code file dicts with 'code', 'path', 'language', 'source' keys
         """
-        if "fineweb" in self.dataset_name:
-            stream = self.stream_fineweb()
-        elif "finewiki" in self.dataset_name:
-            stream = self.stream_finewiki()
-        elif "stack" in self.dataset_name:
-            stream = self.stream_the_stack()
+        print(f"Streaming The-Stack dataset (language={language})...")
+        ds = load_dataset(
+            "bigcode/the-stack-v2",
+            data_dir=f"data/{language}",
+            split="train",
+            streaming=True,
+        )
+        count = 0
+        for item in ds:
+            if self.limit and count >= self.limit:
+                break
+            yield {
+                "code": item.get("content", ""),
+                "path": item.get("path", ""),
+                "language": language,
+                "source": "the-stack",
+            }
+            count += 1
+        print(f"✅ Streamed {count} {language} files from The-Stack")
+
+    def stream(self) -> Generator[Dict, None, None]:
+        """Stream the configured dataset."""
+        if self.dataset_name == "fineweb":
+            yield from self.stream_fineweb()
+        elif self.dataset_name == "finewiki":
+            yield from self.stream_finewiki()
+        elif self.dataset_name == "the-stack":
+            yield from self.stream_the_stack()
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
-        
-        for i, doc in enumerate(stream):
-            # Generate Python code to add to REPL
-            code = f"""
-# Streamed document {i} from {self.dataset_name}
-{var_name}_{i} = {repr(doc)}
-"""
-            yield code
 
+    def stream_to_repl(self, var_prefix: str = "context") -> Generator[str, None, None]:
+        """
+        Stream dataset as Python code to load into REPL.
 
-class ByteDatasetTokenizer:
-    """
-    Byte-level tokenizer for omni-model
-    Vocabulary: 0-255 (fixed, no training needed)
-    """
-    
-    def __init__(self):
-        self.vocab_size = 256
-        self.eos_token = 255  # Use last byte as EOS
-    
-    def encode(self, text: str) -> List[int]:
-        """
-        Convert text to byte sequence (0-255)
-        
         Args:
-            text: Input text
-            
-        Returns:
-            List of byte values
-        """
-        return [b for b in text.encode('utf-8')]
-    
-    def decode(self, byte_sequence: List[int]) -> str:
-        """
-        Convert byte sequence back to text
-        
-        Args:
-            byte_sequence: List of byte values (0-255)
-            
-        Returns:
-            Decoded text
-        """
-        return bytes(byte_sequence).decode('utf-8')
-    
-    def encode_dataset(self, dataset_stream: Generator[Dict, None, None]) -> Generator[List[int], None, None]:
-        """
-        Encode entire dataset as byte sequences
-        
-        Args:
-            dataset_stream: Generator of documents
-            
+            var_prefix: Variable name prefix (e.g. "context" → context_0, context_1, ...)
+
         Yields:
-            Byte sequences
+            Python code strings that set context variables
         """
-        for doc in dataset_stream:
-            text = doc.get("text", doc.get("code", ""))
-            yield self.encode(text)
-    
-    def get_stats(self, dataset_stream: Generator[Dict, None, None]) -> Dict:
+        for i, doc in enumerate(self.stream()):
+            yield f"{var_prefix}_{i} = {repr(doc)}"
+
+    def load_to_rlm_context(self, **kwargs):
         """
-        Get byte distribution statistics
-        
+        Load dataset directly to RLM context.
+
         Args:
-            dataset_stream: Generator of documents
-            
+            **kwargs: Additional arguments for loading
+        """
+        if self.rlm is None:
+            raise ValueError("RLM instance not provided")
+
+        count = 0
+        for i, doc in enumerate(self.stream()):
+            self.rlm._persistent_env.load_context(doc)
+            count += 1
+            print(f"  Loaded context_{i}: {len(str(doc))} bytes")
+
+        print(f"✅ Loaded {count} documents into RLM context")
+        return count
+
+
+class ByteGroupTokenizer:
+    """
+    Byte-group tokenizer for CoDAR.
+
+    Groups contiguous bytes into tokens at natural boundaries.
+    "Hello World!" → [[72,101,108,108,111], [32], [87,111,114,108,100,33]]
+                      "Hello"                " "    "World!"
+
+    Every byte is a real token — spaces, newlines, punctuation are all
+    meaningful byte-group tokens needed for language formation.
+    """
+
+    # Boundary bytes — each becomes its own 1-byte token
+    BOUNDARIES = {
+        0x20,  # space
+        0x0A,  # newline
+        0x0D,  # carriage return
+        0x09,  # tab
+        0x00,  # null (padding)
+    }
+
+    def __init__(self):
+        self.vocab_size = 256  # All possible byte values
+
+    def tokenize(self, raw_bytes: list) -> list:
+        """
+        Group bytes at natural boundaries.
+
+        Each boundary byte (space, newline, tab, null) becomes its own
+        1-byte token. Contiguous non-boundary bytes form multi-byte tokens.
+
+        Args:
+            raw_bytes: List of integers (0-255)
+
+        Returns:
+            List of byte-group tokens (each a list of ints)
+        """
+        groups = []
+        current_group = []
+
+        for b in raw_bytes:
+            if b in self.BOUNDARIES:
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+                groups.append([b])  # boundary byte is its own token
+            else:
+                current_group.append(b)
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    def detokenize(self, groups: list) -> bytes:
+        """
+        Flatten byte-groups back to bytes.
+
+        Args:
+            groups: List of byte-group tokens
+
+        Returns:
+            Raw bytes
+        """
+        return bytes(b for group in groups for b in group)
+
+    def encode(self, text: str) -> list:
+        """
+        Encode text to byte-group tokens.
+
+        Args:
+            text: Input text string
+
+        Returns:
+            List of byte-group tokens
+        """
+        return self.tokenize(list(text.encode('utf-8')))
+
+    def decode(self, groups: list) -> str:
+        """
+        Decode byte-group tokens back to text.
+
+        Args:
+            groups: List of byte-group tokens
+
+        Returns:
+            Decoded text string
+        """
+        return self.detokenize(groups).decode('utf-8', errors='ignore')
+
+    def get_stats(self, doc_stream: Generator) -> Dict:
+        """
+        Get byte distribution statistics from a document stream.
+
+        Args:
+            doc_stream: Generator of document dicts
+
         Returns:
             Statistics dictionary
         """
         byte_counts = [0] * 256
         total_bytes = 0
-        
-        for doc in dataset_stream:
+        total_docs = 0
+        total_groups = 0
+
+        for doc in doc_stream:
             text = doc.get("text", doc.get("code", ""))
-            bytes_seq = self.encode(text)
-            total_bytes += len(bytes_seq)
-            
-            for b in bytes_seq:
+            raw = list(text.encode('utf-8'))
+            groups = self.tokenize(raw)
+
+            total_bytes += len(raw)
+            total_docs += 1
+            total_groups += len(groups)
+
+            for b in raw:
                 byte_counts[b] += 1
-        
-        # Find most/least common bytes
+
         most_common = max(range(256), key=lambda i: byte_counts[i])
         least_common = min(range(256), key=lambda i: byte_counts[i])
-        
+
         return {
             "total_bytes": total_bytes,
+            "total_docs": total_docs,
+            "total_groups": total_groups,
+            "avg_bytes_per_doc": total_bytes / max(1, total_docs),
+            "avg_groups_per_doc": total_groups / max(1, total_docs),
             "vocab_size": self.vocab_size,
             "most_common_byte": most_common,
             "most_common_count": byte_counts[most_common],
             "least_common_byte": least_common,
             "least_common_count": byte_counts[least_common],
-            "avg_bytes_per_doc": total_bytes / max(1, self.count if hasattr(self, 'count') else 1)
         }
 
 
-# Example usage
+# Legacy alias for backward compatibility
+ByteDatasetTokenizer = ByteGroupTokenizer
+
+
 if __name__ == "__main__":
-    # Stream FineWeb
-    streamer = DatasetStreamer("fineweb", limit=10)
-    
-    tokenizer = ByteDatasetTokenizer()
-    
-    print("Streaming and tokenizing FineWeb dataset...")
-    stats = tokenizer.get_stats(streamer.stream_fineweb())
-    
-    print(f"\nDataset Statistics:")
-    print(f"  Total bytes: {stats['total_bytes']:,}")
-    print(f"  Vocab size: {stats['vocab_size']} (fixed)")
-    print(f"  Most common byte: {stats['most_common_byte']} ({stats['most_common_count']:,} occurrences)")
-    print(f"  Average bytes/doc: {stats['avg_bytes_per_doc']:,.0f}")
+    # Test byte-group tokenizer
+    tokenizer = ByteGroupTokenizer()
+
+    text = "Hello World!"
+    groups = tokenizer.encode(text)
+    print(f"Text: {text!r}")
+    print(f"Groups: {groups}")
+    print(f"Decoded: {tokenizer.decode(groups)!r}")
+    print(f"Token count: {len(groups)}")
+
+    # Multi-line
+    text2 = "Hello\nWorld\nFoo Bar"
+    groups2 = tokenizer.encode(text2)
+    print(f"\nText: {text2!r}")
+    print(f"Groups: {groups2}")
+    print(f"Token count: {len(groups2)}")

@@ -1,292 +1,309 @@
 """
 RLCoDAR-HyperAGI: OpenAI-Compatible API Server
 
-Connects litellm (used by HyperAgents) to RLM backend.
-HyperAgents needs ZERO code changes - just point litellm to this server.
+CoDAR IS the model. No external LLM calls.
+Indexes repo bytes + datasets, reasons via diffusion, returns passages.
 
 Usage:
     python -m rlcodar_hyperagi.api --port 8000
 
-Then in HyperAgents .env:
-    OPENAI_API_KEY=not-needed
-    OPENAI_BASE_URL=http://localhost:8000/v1
+The API key is OpenAI-compatible but serves OUR model:
+    Authorization: Bearer rlcodar-...
 """
 
-from fastapi import FastAPI, HTTPException, Header, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-import uvicorn
 import os
 import sys
+import time
+import json
+from typing import List, Dict, Any, Optional
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from rlm import RLM
-from rlm.logger import RLMLogger
-
-app = FastAPI(
-    title="RLCoDAR-HyperAGI API",
-    description="OpenAI-compatible API for RLM + HyperAgents",
-    version="1.0.0"
+from rlcodar_hyperagi.diffusion import (
+    CoDARDiffusion,
+    ByteIndex,
+    CosineNoiseSchedule,
+    ByteGroupTokenizer,
 )
 
-# API Key security
-security = HTTPBearer(auto_error=False)
+try:
+    from fastapi import FastAPI, HTTPException, Security
+    from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+    from pydantic import BaseModel
+    import uvicorn
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
 
-# Global RLM instance
-_rlm_instance: Optional[RLM] = None
+# Master API key — OUR model's key, OpenAI-compatible format
+MASTER_API_KEY = os.getenv(
+    "RLCODAR_API_KEY",
+    "rlcodar-3f7c5f8231d7ad7f7c1629a09c4214c41fa6df00d7d83ec38966978c1ec2d398"
+)
 
-# Master API key
-MASTER_API_KEY = os.getenv("RLCODAR_API_KEY", "rlcodar-3f7c5f8231d7ad7f7c1629a09c4214c41fa6df00d7d83ec38966978c1ec2d398")
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str = "rlcodar"
-    messages: List[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 16384
-    stream: bool = False
+# Global CoDAR instance
+_codar: Optional[CoDARDiffusion] = None
+_index: Optional[ByteIndex] = None
 
 
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, int]
+def init_codar(repo_root: str = None):
+    """
+    Initialize CoDAR by indexing repo files.
+
+    This is the "model loading" step — the index IS the weights.
+    """
+    global _codar, _index
+
+    if repo_root is None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    print(f"📄 Indexing repo: {repo_root}")
+
+    _index = ByteIndex()
+    total = _index.add_directory(repo_root)
+
+    schedule = CosineNoiseSchedule(T=100)
+    tokenizer = ByteGroupTokenizer()
+    _codar = CoDARDiffusion(_index, schedule, tokenizer)
+
+    print(f"✅ CoDAR initialized: {_index.stats['total_groups']} groups from {_index.stats['total_sources']} sources ({_index.stats['total_bytes']} bytes)")
+
+    return _codar
 
 
-async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
-    """Verify API key from Authorization header"""
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Missing API key")
+# ============================================================================
+# CLI Mode (no FastAPI needed)
+# ============================================================================
 
-    # Extract key from "Bearer <key>" format
-    provided_key = credentials.credentials
-
-    # Check against master key
-    if provided_key != MASTER_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    return provided_key
+def cli_completion(prompt: str) -> str:
+    """Run a completion in CLI mode."""
+    global _codar
+    if _codar is None:
+        init_codar()
+    return _codar.completion(prompt)
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize RLM on startup"""
-    global _rlm_instance
+def cli_repl():
+    """Interactive REPL mode."""
+    global _codar
+    if _codar is None:
+        init_codar()
 
-    # Get API key from env (for HyperAgents compatibility)
-    api_key = os.getenv("OPENAI_API_KEY", "not-needed")
-    backend = os.getenv("RLM_BACKEND", "openai")
-    model_name = os.getenv("RLM_MODEL", "gpt-4o")
+    print("\n🤖 RLCoDAR REPL (type 'quit' to exit)\n")
+    while True:
+        try:
+            prompt = input(">>> ")
+            if prompt.strip().lower() in ('quit', 'exit', 'q'):
+                break
+            if not prompt.strip():
+                continue
+            response = _codar.completion(prompt)
+            print(f"\n{response}\n")
+        except (KeyboardInterrupt, EOFError):
+            break
+    print("\nBye!")
 
-    # Handle API key - use dummy key if not provided (for testing)
-    if api_key in ["not-needed", "sk-xxxxx***********************xxxx", ""]:
-        api_key = "test-key"  # RLM will use this for local testing
 
-    _rlm_instance = RLM(
-        backend=backend,
-        backend_kwargs={
-            "model_name": model_name,
-            "api_key": api_key if api_key != "test-key" else None
-        },
-        environment="local",
-        environment_kwargs={},
-        max_depth=2,  # Enable recursive reasoning
-        max_iterations=30,
-        persistent=True,  # Keep context across calls
-        compaction=True,  # Auto-summarize when context grows
-        verbose=False,
-        logger=RLMLogger()
+# ============================================================================
+# FastAPI Server Mode
+# ============================================================================
+
+if HAS_FASTAPI:
+    app = FastAPI(
+        title="RLCoDAR-HyperAGI API",
+        description="CoDAR byte-level diffusion model — OpenAI-compatible",
+        version="2.0.0"
     )
 
-    print(f"✅ RLM initialized: backend={backend}, model={model_name}")
-    print(f"🔑 API Key: {MASTER_API_KEY[:30]}...")
+    security = HTTPBearer(auto_error=False)
 
+    class ChatMessage(BaseModel):
+        role: str
+        content: str
 
-@app.get("/health")
-async def health():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "rlcodar-hyperagi",
-        "rlm_loaded": _rlm_instance is not None
-    }
+    class ChatCompletionRequest(BaseModel):
+        model: str = "rlcodar"
+        messages: List[ChatMessage]
+        temperature: float = 0.7
+        max_tokens: int = 16384
+        stream: bool = False
 
+    class ChatCompletionResponse(BaseModel):
+        id: str
+        object: str = "chat.completion"
+        created: int
+        model: str
+        choices: List[Dict[str, Any]]
+        usage: Dict[str, int]
 
-@app.get("/v1/models")
-async def list_models():
-    """List available models (OpenAI compatibility)"""
-    return {
-        "object": "list",
-        "data": [
-            {
+    async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
+        """Verify API key."""
+        if credentials is None:
+            raise HTTPException(status_code=401, detail="Missing API key")
+        if credentials.credentials != MASTER_API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid API key")
+        return credentials.credentials
+
+    @app.on_event("startup")
+    async def startup_event():
+        """Index repo on startup — this IS model loading."""
+        init_codar()
+
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "service": "rlcodar-hyperagi",
+            "model": "codar",
+            "indexed": _index.stats if _index else {},
+        }
+
+    @app.get("/v1/models")
+    async def list_models():
+        return {
+            "object": "list",
+            "data": [{
                 "id": "rlcodar",
                 "object": "model",
-                "created": 1711500000,
+                "created": int(time.time()),
                 "owned_by": "rlcodar-hyperagi"
-            }
-        ]
-    }
+            }]
+        }
 
+    @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+    async def chat_completions(
+        request: ChatCompletionRequest,
+        api_key: str = Security(verify_api_key)
+    ):
+        """CoDAR completion — no external LLM calls."""
+        if _codar is None:
+            raise HTTPException(status_code=503, detail="CoDAR not initialized")
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def chat_completions(request: ChatCompletionRequest, api_key: str = Security(verify_api_key)):
-    """
-    Chat completion endpoint (OpenAI-compatible)
+        prompt = request.messages[-1].content
 
-    This is what litellm calls from HyperAgents.
-    """
-    if _rlm_instance is None:
-        raise HTTPException(status_code=503, detail="RLM not initialized")
+        try:
+            response_text = _codar.completion(prompt)
 
-    # Get last user message
-    last_message = request.messages[-1]
-    prompt = last_message.content
+            input_tokens = len(prompt.encode('utf-8'))
+            output_tokens = len(response_text.encode('utf-8'))
 
-    try:
-        # Call RLM completion
-        result = _rlm_instance.completion(prompt)
-
-        # Compute usage (approximate)
-        input_tokens = len(prompt) // 4
-        output_tokens = len(result.response) // 4
-
-        return ChatCompletionResponse(
-            id=f"rlcodar-{id(result)}",
-            created=1711500000,
-            model=request.model,
-            choices=[
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": result.response
-                    },
-                    "finish_reason": "stop"
-                }
-            ],
-            usage={
-                "prompt_tokens": input_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens
-            }
-        )
-
-    except Exception as e:
-        error_msg = str(e)
-        # Handle API key errors gracefully
-        if "api key" in error_msg.lower() or "401" in error_msg:
             return ChatCompletionResponse(
-                id=f"rlcodar-{id(prompt)}",
-                created=1711500000,
+                id=f"rlcodar-{int(time.time() * 1000)}",
+                created=int(time.time()),
                 model=request.model,
                 choices=[{
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": f"⚠️ API key not configured. To use this API:\n\n1. Set OPENAI_API_KEY environment variable\n2. Or use a local model (Ollama, vLLM)\n\nCurrent backend: {_rlm_instance.backend}\n\nFor testing, you can:\n- export OPENAI_API_KEY=sk-your-key\n- Or configure RLM_BACKEND=ollama for local models"
+                        "content": response_text
                     },
                     "finish_reason": "stop"
                 }],
-                usage={"prompt_tokens": 0, "completion_tokens": 100, "total_tokens": 100}
+                usage={
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens
+                }
             )
-        raise HTTPException(status_code=500, detail=error_msg)
 
-
-@app.post("/v1/completions")
-async def completions(request: Any):
-    """Legacy completions endpoint (OpenAI compatibility)"""
-    raise HTTPException(status_code=501, detail="Use /v1/chat/completions instead")
-
-
-@app.get("/v1/rlm/status")
-async def rlm_status():
-    """Get RLM status and stats"""
-    if _rlm_instance is None:
-        return {"status": "not_initialized"}
-
-    return {
-        "status": "ready",
-        "backend": _rlm_instance.backend,
-        "environment": _rlm_instance.environment_type,
-        "max_iterations": _rlm_instance.max_iterations,
-        "max_depth": _rlm_instance.max_depth,
-        "persistent": _rlm_instance.persistent,
-        "compaction": _rlm_instance.compaction
-    }
-
-
-@app.post("/v1/rlm/load_context")
-async def load_context(files: List[str]):
-    """
-    Load files as RLM context
-
-    This is how HyperAgents can load repo files as "model weights"
-    """
-    if _rlm_instance is None:
-        raise HTTPException(status_code=503, detail="RLM not initialized")
-
-    loaded = []
-    for file_path in files:
-        try:
-            with open(file_path, 'r') as f:
-                content = f.read()
-
-            # RLM loads as context_0, context_1, etc.
-            # This happens automatically in the REPL environment
-            loaded.append({
-                "path": file_path,
-                "size": len(content),
-                "status": "loaded"
-            })
         except Exception as e:
-            loaded.append({
-                "path": file_path,
-                "status": "error",
-                "error": str(e)
-            })
+            raise HTTPException(status_code=500, detail=str(e))
 
-    return {"loaded": loaded}
+    @app.get("/v1/rlm/status")
+    async def rlm_status():
+        """CoDAR model status."""
+        if _index is None:
+            return {"status": "not_initialized"}
+        return {
+            "status": "ready",
+            "model": "codar",
+            "backend": "pure-python-diffusion",
+            "index": _index.stats,
+            "sources": list(_index.sources.keys())[:20],
+        }
+
+    @app.post("/v1/rlm/load_context")
+    async def load_context(
+        files: List[str],
+        api_key: str = Security(verify_api_key)
+    ):
+        """Add files to the byte index."""
+        if _index is None:
+            raise HTTPException(status_code=503, detail="CoDAR not initialized")
+
+        loaded = []
+        for file_path in files:
+            try:
+                count = _index.add_file(file_path)
+                loaded.append({
+                    "path": file_path,
+                    "groups": count,
+                    "status": "indexed"
+                })
+            except Exception as e:
+                loaded.append({
+                    "path": file_path,
+                    "status": "error",
+                    "error": str(e)
+                })
+
+        return {"loaded": loaded}
 
 
 def main():
-    """Run API server"""
+    """Run API server or CLI."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="RLCoDAR-HyperAGI API Server")
+    parser = argparse.ArgumentParser(description="RLCoDAR-HyperAGI")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--reload", action="store_true")
+    parser.add_argument("--repl", action="store_true", help="Run in REPL mode")
+    parser.add_argument("--query", type=str, help="Single query mode")
+    parser.add_argument("--repo", type=str, help="Repo root to index")
 
     args = parser.parse_args()
+
+    if args.query:
+        if args.repo:
+            init_codar(args.repo)
+        else:
+            init_codar()
+        print(cli_completion(args.query))
+        return
+
+    if args.repl:
+        if args.repo:
+            init_codar(args.repo)
+        else:
+            init_codar()
+        cli_repl()
+        return
+
+    if not HAS_FASTAPI:
+        print("❌ FastAPI not installed. Use --repl or --query mode, or: pip install fastapi uvicorn")
+        return
 
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
 ║                                                          ║
-║   🚀 RLCoDAR-HyperAGI API Server                         ║
-║   OpenAI-Compatible Endpoint for HyperAgents            ║
+║   🚀 RLCoDAR-HyperAGI API Server v2.0                   ║
+║   CoDAR Byte-Level Diffusion Model                       ║
+║   No external LLM — pure Python inference                ║
 ║                                                          ║
 ║   Host: {args.host:<42} ║
 ║   Port: {args.port:<42} ║
 ║                                                          ║
-║   litellm Configuration:                                ║
-║   OPENAI_BASE_URL=http://{args.host}:{args.port}/v1              ║
-║   OPENAI_API_KEY=not-needed                             ║
+║   Endpoints:                                             ║
+║   POST /v1/chat/completions  (OpenAI-compatible)         ║
+║   GET  /v1/models                                        ║
+║   GET  /health                                           ║
+║   GET  /v1/rlm/status                                    ║
 ║                                                          ║
 ╚══════════════════════════════════════════════════════════╝
     """)
 
-    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

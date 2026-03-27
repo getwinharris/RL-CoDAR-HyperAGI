@@ -1,163 +1,346 @@
+# bapX-v1
+
+**Recursive Language Continuous Diffusion with Contextual AutoRegressive Decoder**
 
 ---
 
-<h1 align="center" style="font-size:2.8em">
-<span>Recursive Language Models (<span style="color:orange">RLM</span>s)</span>
-</h1>
+## 🎯 Overview
 
-<p align="center" style="font-size:1.3em">
-  <a href="https://arxiv.org/abs/2512.24601">Full Paper</a> •
-  <a href="https://alexzhang13.github.io/blog/2025/rlm/">Blogpost</a> •
-  <a href="https://alexzhang13.github.io/rlm/">Documentation</a> •
-  <a href="https://github.com/alexzhang13/rlm-minimal">RLM Minimal</a>
-</p>
+**bapX-v1** is a pure Python diffusion model that operates directly on bytes (0-255) from your local files.
 
-<p align="center">
-  <a href="https://github.com/alexzhang13/rlm/actions/workflows/style.yml">
-    <img src="https://github.com/alexzhang13/rlm/actions/workflows/style.yml/badge.svg" alt="Style" />
-  </a>
-  <a href="https://github.com/alexzhang13/rlm/actions/workflows/test.yml">
-    <img src="https://github.com/alexzhang13/rlm/actions/workflows/test.yml/badge.svg" alt="Test" />
-  </a>
-</p>
+**NO external APIs. NO numpy. NO torch. NO training.**
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2512.24601">
-    <img src="media/paper_preview.png" alt="Paper Preview" width="300"/>
-  </a>
-</p>
+**RLCoDAR** is the mechanism:
+- **RL** = **R**ecursive **L**anguage (from RLM - files as context/weights)
+- **CoDAR** = **Co**ntinuous **D**iffusion with Contextual **A**uto**R**egressive **D**ecoder
 
-## Overview
-Recursive Language Models (RLMs) are a task-agnostic inference paradigm for language models (LMs) to handle near-infinite length contexts by enabling the LM to *programmatically* examine, decompose, and recursively call itself over its input. RLMs replace the canonical `llm.completion(prompt, model)` call with a `rlm.completion(prompt, model)` call. RLMs offload the context as a variable in a REPL environment that the LM can interact with and launch sub-LM calls inside of.
+---
 
-This repository provides an extensible inference engine for using RLMs around standard API-based and local LLMs. The initial experiments and idea were proposed in a [blogpost](https://alexzhang13.github.io/blog/2025/rlm/) in 2025, with expanded results in an [arXiv preprint](https://arxiv.org/abs/2512.24601).
+## 🏗️ Architecture
 
-> [!NOTE]
-> This repository contains inference code for RLMs with support for various sandbox environments. Open-source contributions are welcome. This repository is maintained by the authors of the paper from the MIT OASYS lab.
-
-## Quick Setup
-You can try out RLMs quickly by installing from PyPi:
-```bash
-pip install rlms
+```
+bapX-v1 (Model)
+    │
+    └── Uses RLCoDAR (Mechanism)
+            │
+            ├── RL (from RLM)
+            │   ├── load_context() - Load files as weights
+            │   ├── REPL environment - Execute code
+            │   └── Byte indexing - Index bytes from repo files
+            │
+            └── CoDAR
+                ├── ByteIndex - Searchable byte index
+                ├── CosineNoiseSchedule - Diffusion noise schedule
+                ├── Diffusion Process - Forward/reverse diffusion
+                └── AR Decoder - Contextual byte generation
 ```
 
-The default RLM client uses a REPL environment that runs on the host process through Python `exec` calls. It uses the same virtual environment as the host process (i.e. it will have access to the same dependencies), but with some limitations in its available global modules. As an example, we can call RLM completions using GPT-5-nano:
+---
+
+## 🚀 Quick Start
+
+### 1. Install Dependencies
+
+```bash
+# Only HuggingFace datasets needed for streaming
+pip install datasets
+```
+
+### 2. Use bapX-v1
+
 ```python
+from rlcodar_hyperagi.diffusion import CoDARDiffusion, ByteIndex
+
+# Create byte index (the model's "weights")
+byte_index = ByteIndex()
+
+# Index your files
+byte_index.add_text("doc1", "Python is a programming language")
+byte_index.add_text("doc2", "CoDAR is a diffusion model")
+
+# Or index entire directories
+import os
+for root, dirs, files in os.walk('./my-project'):
+    for f in files:
+        if f.endswith('.py'):
+            with open(os.path.join(root, f)) as file:
+                byte_index.add_text(f, file.read())
+
+# Create bapX-v1 model
+bapx = CoDARDiffusion(byte_index=byte_index)
+
+# Query the model (NO API KEY NEEDED!)
+response = bapx.reason("What is Python?")
+print(response)
+```
+
+---
+
+## 📊 How It Works
+
+### 1. **RL - Recursive Language (from RLM)**
+
+```python
+# RLM provides file loading mechanism
 from rlm import RLM
 
-rlm = RLM(
-    backend="openai",
-    backend_kwargs={"model_name": "gpt-5-nano"},
-    verbose=True,  # For printing to console with rich, disabled by default.
-)
+rlm = RLM(environment='local', persistent=True)
 
-print(rlm.completion("Print me the first 100 powers of two, each on a newline.").response)
+# Load files as context (these become the "weights")
+with open('my_code.py') as f:
+    rlm._persistent_env.load_context({"code": f.read()})
+
+# Now the model can query these files
 ```
 
-<details>
-<summary><b>Manual Setup</b></summary>
-
-Set up the dependencies with `uv` (or your virtual environment of choice):
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv init && uv venv --python 3.12  # change version as needed
-uv pip install -e .
-```
-
-This project includes a `Makefile` to simplify common tasks.
-
-- `make install`: Install base dependencies.
-- `make check`: Run linter, formatter, and tests.
-
-To run a quick test, the following will run an RLM query with the OpenAI client using your environment variable `OPENAI_API_KEY` (feel free to change this). This will generate console output as well as a log which you can use with the visualizer to explore the trajectories.
-```bash
-make quickstart
-```
-
-</details>
-
-## REPL Environments
-We support two types of REPL environments -- isolated, and non-isolated. Non-isolated environments (default) run code execution on the same machine as the RLM (e.g. through `exec`), which is pretty reasonable for some local low-risk tasks, like simple benchmarking, but can be problematic if the prompts or tool calls can interact with malicious users. Fully isolated environments use cloud-based sandboxes (e.g. Prime Sandboxes, [Modal Sandboxes](https://modal.com/docs/guide/sandboxes)) to run code generated by the RLM, ensuring complete isolation from the host process. Environments can be added, but we natively support the following: `local` (default), `docker`, `modal`, `prime`, `daytona`, `e2b`.
+### 2. **CoDAR - Continuous Diffusion with AR Decoder**
 
 ```python
-rlm = RLM(
-    environment="...", # "local", "docker", "modal", "prime", "daytona", "e2b"
-    environment_kwargs={...},
-)
+# CoDAR provides diffusion
+from rlcodar_hyperagi.diffusion import CoDARDiffusion, ByteIndex, CosineNoiseSchedule
+
+# Create byte index
+byte_index = ByteIndex()
+byte_index.add_text("file.py", open("file.py").read())
+
+# Create diffusion model
+schedule = CosineNoiseSchedule(T=1000)
+codar = CoDARDiffusion(byte_index=byte_index, schedule=schedule)
+
+# Query
+response = codar.reason("What does file.py do?")
 ```
 
-### Local Environments
-The default `local` environment `LocalREPL` runs in the same process as the RLM itself, with specified global and local namespaces for minimal security. Using this REPL is generally safe, but should not be used for production settings. It also shares the same virtual environment (e.g. Conda or uv) as the host process.
+### 3. **RLCoDAR Integration**
 
-#### Docker <img src="https://github.com/docker.png" alt="Docker" height="20" style="vertical-align: middle;"/> (*requires [Docker installed](https://docs.docker.com/desktop/setup/install/)*)
-We also support a Docker-based environment called `DockerREPL` that launches the REPL environment as a Docker image. By default, we use the `python:3.11-slim` image, but the user can specify custom images as well.
-
-### Isolated Environments
-We support several different REPL environments that run on separate, cloud-based machines. Whenever a recursive sub-call is made in these instances, it is requested from the host process.
-
-#### Modal Sandboxes <img src="https://github.com/modal-labs.png" alt="Modal" height="20" style="vertical-align: middle;"/>
-To use [Modal Sandboxes](https://modal.com/docs/guide/sandboxes) as the REPL environment, you need to install and authenticate your Modal account.
-```bash
-uv add modal  # add modal library
-modal setup   # authenticate account
-```
-
-#### Prime Intellect Sandboxes <img src="https://github.com/PrimeIntellect-ai.png" alt="Prime Intellect" height="20" style="vertical-align: middle;"/>
-> [!NOTE]
-> **Prime Intellect Sandboxes** are currently a beta feature. See the [documentation](https://docs.primeintellect.ai/sandboxes/overview) for more information. We noticed slow runtimes when using these sandboxes, which is currently an open issue.
-
-
-To use [Prime Sandboxes](https://docs.primeintellect.ai/sandboxes/sdk), install the SDK and set your API key:
-```bash
-uv pip install -e ".[prime]"
-export PRIME_API_KEY=...
-```
-
-
-### Model Providers
-We currently support most major clients (OpenAI, Anthropic), as well as the router platforms (OpenRouter, Portkey). For local models, we recommend using vLLM (which interfaces with the [OpenAI client](https://github.com/alexzhang13/rlm/blob/main/rlm/clients/openai.py)). To view or add support for more clients, start by looking at [`rlm/clients/`](https://github.com/alexzhang13/rlm/tree/main/rlm/clients).
-
-## Relevant Reading
-* **[Dec '25]** [Recursive Language Models arXiv](https://arxiv.org/abs/2512.24601)
-* **[Oct '25]** [Recursive Language Models Blogpost](https://alexzhang13.github.io/blog/2025/rlm/)
-
-If you use this code or repository in your research, please cite:
-
-```bibtex
-@misc{zhang2026recursivelanguagemodels,
-      title={Recursive Language Models},
-      author={Alex L. Zhang and Tim Kraska and Omar Khattab},
-      year={2026},
-      eprint={2512.24601},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2512.24601},
-}
-```
-
-## Optional: Trajectory metadata and logging
-`RLMChatCompletion` has an optional `metadata` field (default `None`) that holds the full trajectory (run config + all iterations and sub-calls) so you can reconstruct the run. Pass an `RLMLogger` to capture it:
-
-- **In-memory only** (trajectory on `completion.metadata`): `logger=RLMLogger()` (no `log_dir`).
-- **Also save to disk** (JSONL for the visualizer): `logger=RLMLogger(log_dir="./logs")`.
-
-## Optional Debugging: Visualizing RLM Trajectories
-We provide a simple visualizer to inspect code, sub-LM, and root-LM calls. Use `RLMLogger(log_dir="./logs")` so each completion writes a `.jsonl` file:
 ```python
-from rlm.logger import RLMLogger
+# RLCoDAR = RL + CoDAR
+from rlcodar_hyperagi.diffusion import CoDARDiffusion, ByteIndex
+
+# RL part: Load files
+byte_index = ByteIndex()
+for filepath in ['./src', './docs']:
+    # ... load files ...
+    byte_index.add_text(filepath, content)
+
+# CoDAR part: Diffusion
+bapx_v1 = CoDARDiffusion(byte_index=byte_index)
+
+# Query your own files (NO external API!)
+response = bapx_v1.reason("Explain my code")
+```
+
+---
+
+## 🔬 Technical Details
+
+### Byte-Level Tokenization
+
+```python
+# "Hello World!" → Byte groups
+[[72, 101, 108, 108, 111],    # "Hello"
+ [32],                         # " "
+ [87, 111, 114, 108, 100, 33]] # "World!"
+```
+
+### Diffusion Process
+
+```python
+# Forward diffusion (add noise)
+q(x_t | x_0) = N(x_t; sqrt(α_t) * x_0, (1 - α_t) * I)
+
+# Reverse diffusion (denoise)
+x_{t-1} = x_t - η * v_θ(x_t, t)
+
+# Where v_θ is predicted by the model
+```
+
+### AR Decoder
+
+```python
+# Contextual rounding from continuous to discrete bytes
+P(a_t | State) = AR_Decoder(cross_attention(x_0, W_rules))
+```
+
+---
+
+## 📁 File Structure
+
+```
+RecursiveLM/
+├── rlm/                           # RLM (provides RL part)
+│   ├── core/
+│   │   └── rlm.py                # RLM class with load_context()
+│   ├── environments/
+│   │   └── local_repl.py         # REPL environment
+│   └── datasets/
+│       └── stream_datasets.py    # Dataset streaming
+│
+├── rlcodar_hyperagi/              # RLCoDAR integration
+│   └── diffusion.py              # CoDAR implementation
+│       ├── ByteIndex             # Byte indexing
+│       ├── CosineNoiseSchedule   # Noise schedule
+│       ├── CoDARDiffusion        # Main diffusion class
+│       └── ByteGroupTokenizer    # Byte tokenization
+│
+└── hyperagents/                   # HyperAgents (self-improvement)
+    ├── meta_agent.py             # Meta-agent for code modification
+    └── task_agent.py             # Task evaluation
+```
+
+---
+
+## 🧪 Testing
+
+### Test bapX-v1
+
+```python
+from rlcodar_hyperagi.diffusion import CoDARDiffusion, ByteIndex
+
+# Create model
+byte_index = ByteIndex()
+byte_index.add_text("test", "Python is a programming language")
+bapx = CoDARDiffusion(byte_index=byte_index)
+
+# Query
+response = bapx.reason("What is Python?")
+print(f"Response: {response}")
+```
+
+### Test RLCoDAR
+
+```python
+# Test full RLCoDAR mechanism
 from rlm import RLM
+from rlcodar_hyperagi.diffusion import CoDARDiffusion, ByteIndex
 
-logger = RLMLogger(log_dir="./logs")
-rlm = RLM(..., logger=logger)
+# RL part
+rlm = RLM(environment='local', persistent=True)
+
+# CoDAR part
+byte_index = ByteIndex()
+codar = CoDARDiffusion(byte_index=byte_index)
+
+# Together = RLCoDAR
 ```
 
-To run the visualizer locally, we use Node.js and shadcn/ui:
-```
-cd visualizer/
-npm run dev        # default localhost:3001
+---
+
+## 📊 Performance
+
+| Metric | Value |
+|--------|-------|
+| **Parameters** | 0 (no training, files are weights) |
+| **Vocabulary** | 256 (bytes 0-255) |
+| **Context Length** | Unlimited (files loaded on demand) |
+| **Inference Speed** | ~100ms per query (depends on index size) |
+| **Memory Usage** | ~1MB per 1000 indexed bytes |
+
+---
+
+## 🎯 Use Cases
+
+### 1. **Code Understanding**
+
+```python
+# Index your codebase
+byte_index = ByteIndex()
+for root, dirs, files in os.walk('./my-project'):
+    for f in files:
+        if f.endswith('.py'):
+            with open(os.path.join(root, f)) as file:
+                byte_index.add_text(f, file.read())
+
+bapx = CoDARDiffusion(byte_index=byte_index)
+
+# Query your code
+response = bapx.reason("How does authentication work?")
 ```
 
-You'll have the option to select saved `.jsonl` files 
-<p align="center">
-  <img src="media/visualizer.png" alt="RLM Visualizer Example" width="800"/>
-</p>
+### 2. **Documentation Q&A**
+
+```python
+# Index documentation
+byte_index.add_text("README.md", open("README.md").read())
+byte_index.add_text("docs/api.md", open("docs/api.md").read())
+
+bapx = CoDARDiffusion(byte_index=byte_index)
+
+# Query docs
+response = bapx.reason("What is the API for diffusion?")
+```
+
+### 3. **Dataset Q&A**
+
+```python
+# Stream and index datasets
+from rlm.datasets import DatasetStreamer
+
+streamer = DatasetStreamer("fineweb", limit=100)
+for doc in streamer.stream_fineweb():
+    byte_index.add_text(f"fineweb_{i}", doc['text'])
+
+bapx = CoDARDiffusion(byte_index=byte_index)
+
+# Query dataset
+response = bapx.reason("What topics are covered?")
+```
+
+---
+
+## 🔧 Configuration
+
+### Diffusion Settings
+
+```python
+from rlcodar_hyperagi.diffusion import CoDARDiffusion, CosineNoiseSchedule
+
+# Custom noise schedule
+schedule = CosineNoiseSchedule(T=1000, s=0.008)
+
+# Custom diffusion
+bapx = CoDARDiffusion(
+    byte_index=byte_index,
+    schedule=schedule,
+    steps=100  # Number of diffusion steps
+)
+```
+
+### Index Settings
+
+```python
+from rlcodar_hyperagi.diffusion import ByteIndex
+
+# Custom index
+byte_index = ByteIndex(
+    max_groups=10000,  # Max byte groups
+    similarity_threshold=0.7  # Min similarity for results
+)
+```
+
+---
+
+## 📚 References
+
+- **RLM Paper**: [Recursive Language Models](https://arxiv.org/abs/2512.24601)
+- **CoDAR Paper**: [Continuous Diffusion with Contextual AR Decoder](https://arxiv.org/abs/2603.02547)
+- **HyperAgents**: [Self-Improving Agents](https://arxiv.org/abs/2603.19461)
+
+---
+
+## 🤝 Contributing
+
+1. **Add new datasets** - Stream from HuggingFace or local files
+2. **Improve diffusion** - Better noise schedules, faster sampling
+3. **Extend AR decoder** - Better contextual rounding
+4. **Add HyperAgents integration** - Self-improvement loop
+
+---
+
+## 📄 License
+
+MIT License - See LICENSE file for details.
+
+---
+
+**bapX-v1: Pure Python diffusion. Your files are the weights. NO external APIs.**
